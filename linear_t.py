@@ -22,3 +22,4 @@ g = torch.stack(torch.meshgrid(torch.linspace(-.5, 2.5, 31, device=dev),
                                torch.linspace(-.5, 2.5, 31, device=dev), indexing='ij'), -1).reshape(-1, 2)
 W = local_w(g).reshape(31, 31, 2)
 dw1_dx2 = (W[:, 1:, 0] - W[:, :-1, 0]) / 0.1          # ky vong ~ 1[x1>x2], nhoe quanh kink
+print(dw1_dx2)
