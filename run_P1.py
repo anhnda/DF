@@ -27,8 +27,10 @@ torch.set_default_dtype(DT)
 RADII      = [0.40, 0.28, 0.20, 0.14, 0.10, 0.07, 0.05]   # giảm dần
 N_MIN      = 200        # min điểm trong ball để một scale hợp lệ
 DELTA_M    = 0.25       # |m_hat - q| phải < cái này
-FLAT_TOL   = 0.02       # eps_q coi là ~0 nếu dưới ngưỡng này (noise floor)
-FLAT_DROP  = 0.5        # eps_q phải giảm ít nhất hệ số này qua band -> "->0"
+FLOOR      = 1e-4       # noise floor thật (chỉ để coi eps=0 tuyệt đối, vd line/plane)
+DECAY_MIN  = 0.7        # eps_q(r) phải giảm: slope(log eps, log r) >= cái này
+                        #   smooth q-plane: eps ~ r^2 -> slope ~ 2
+                        #   V apex:         eps ~ const -> slope ~ 0  => reject
 DRIFT_TOL  = 0.15       # principal-subspace drift Frobenius
 GAP_MIN    = 3.0        # eigengap tối thiểu để ORIENT basis (khong infer dim)
 
@@ -138,13 +140,29 @@ def geometry_route(X, x0, radii=RADII, d=2):
             evs = [flatness(stats[i], q) for i in idxs]
             if any(e is None for e in evs):
                 continue
-            # eps phải đi xuống và chạm noise floor ở scale mịn nhất
-            goes_to_zero = (evs[-1] < FLAT_TOL) or (evs[-1] < FLAT_DROP*evs[0])
-            drift_ok = all(
-                (subspace_drift(stats[a], stats[b], q) or 9) < DRIFT_TOL
-                for a, b in zip(idxs[:-1], idxs[1:]))
+            rs = [radii[i] for i in idxs]
+            # --- QUYẾT ĐỊNH FLATNESS ---
+            # Chart q tồn tại khi eps_q(r) HOẶC đã bằng 0 tuyệt đối (line/plane),
+            # HOẶC GIẢM khi r giảm (smooth manifold: eps ~ r^2). PLATEAU ở c>0
+            # (V apex) => slope ~ 0 => KHÔNG có q-plane khi zoom => reject.
+            # Phân biệt bằng SLOPE(log eps, log r), KHÔNG bằng ngưỡng tuyệt đối.
+            if max(evs) < FLOOR:
+                flat_ok = True                    # phẳng tuyệt đối (line/plane)
+            else:
+                lr = torch.tensor([math.log(r) for r in rs])
+                le = torch.tensor([math.log(max(e, 1e-12)) for e in evs])
+                mx, my = lr.mean(), le.mean()
+                denom = ((lr-mx)**2).sum()
+                slope = float(((lr-mx)*(le-my)).sum()/denom) if denom > 0 else 0.0
+                # r giảm -> log r giảm; eps giảm -> log eps giảm => slope > 0.
+                flat_ok = slope >= DECAY_MIN
+            drift_ok = True
+            for a, b in zip(idxs[:-1], idxs[1:]):
+                dd = subspace_drift(stats[a], stats[b], q)
+                if dd is None or dd >= DRIFT_TOL:
+                    drift_ok = False; break
             gap_ok = all(eigengap(stats[i], q) > GAP_MIN for i in idxs) if q < d else True
-            if goes_to_zero and drift_ok and gap_ok:
+            if flat_ok and drift_ok and gap_ok:
                 return [radii[i] for i in idxs]
         return None
 
@@ -153,8 +171,18 @@ def geometry_route(X, x0, radii=RADII, d=2):
         return dict(status='abstain', q=None, reason=f'dimension-unstable(m={m_hat:.2f})',
                     m_hat=m_hat, counts=ns, flatness=eps, drift=drifts, gaps=gaps)
     if band is None:
-        # dimension ok (q=1) nhưng KHÔNG có q-plane phẳng ở fine scale -> V apex
-        return dict(status='abstain', q=q, reason='not-locally-q-flat (eps_q plateau>0)',
+        # dimension ok (q=1) nhưng KHÔNG có q-plane phẳng ở fine scale.
+        # phân biệt: eps plateau (V apex thật) vs eps giảm-quá-chậm (resolution-limited).
+        ev_fine = [flatness(stats[i], q) for i in valid if flatness(stats[i], q) is not None]
+        if len(ev_fine) >= 2 and max(ev_fine) >= FLOOR:
+            drop = ev_fine[-1] / max(ev_fine[0], 1e-12)
+            if drop > 0.7:      # gần như không giảm -> plateau -> V apex
+                reason = 'not-locally-q-flat (eps_q plateau>0)'
+            else:               # có giảm nhưng chưa đủ dốc/chưa chạm floor
+                reason = 'resolution-limited: no stable smooth scale band'
+        else:
+            reason = 'not-locally-q-flat'
+        return dict(status='abstain', q=q, reason=reason,
                     m_hat=m_hat, counts=ns, flatness=eps, drift=drifts, gaps=gaps,
                     band=None)
     return dict(status='tangent', q=q, reason='q-flat-stable', m_hat=m_hat,
@@ -196,6 +224,15 @@ def report(name, X, x0, expect):
     if r.get('flatness'):
         fl = "  ".join(f"r={rr:.2f}:{ee:.3f}" for rr, ee in r['flatness'] if ee is not None)
         print(f"  flatness eps_q(r):  {fl}")
+        evs = [(rr, ee) for rr, ee in r['flatness'] if ee is not None and ee > 1e-12]
+        if len(evs) >= 2:
+            lr = torch.tensor([math.log(rr) for rr, _ in evs])
+            le = torch.tensor([math.log(ee) for _, ee in evs])
+            mx, my = lr.mean(), le.mean()
+            dn = ((lr-mx)**2).sum()
+            sl = float(((lr-mx)*(le-my)).sum()/dn) if dn > 0 else 0.0
+            print(f"  eps decay slope(log eps/log r) = {sl:.2f}   "
+                  f"(smooth~2 -> chart tồn tại; ~0 plateau -> V, abstain)")
     if r.get('band'):
         print(f"  selected fine-scale band = {r['band']}")
     if r.get('gaps'):
