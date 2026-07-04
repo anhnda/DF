@@ -66,9 +66,14 @@ def chord_path(b, x, n):
     return b[None, :] + t[:, None] * (x - b)[None, :]
 
 
-def geodesic_path(tb, tx, n):
-    # shorter arc on S^1 from angle tb to tx
-    dt = (tx - tb + torch.pi) % (2 * torch.pi) - torch.pi  # wrap to [-pi,pi]
+def geodesic_path(tb, tx, n, arc="short"):
+    # arc="short": minor arc (wrap to [-pi,pi]); "long": major arc (2pi - short)
+    dt_short = (tx - tb + torch.pi) % (2 * torch.pi) - torch.pi  # in [-pi,pi]
+    if arc == "short":
+        dt = dt_short
+    else:
+        # major arc: go the other way round the circle
+        dt = dt_short - torch.sign(dt_short) * (2 * torch.pi)
     s = (torch.arange(n, device=DEVICE, dtype=DTYPE) + 0.5) / n
     angles = tb + s * dt
     return circle_pt(angles)
@@ -103,39 +108,51 @@ def count_kink_crossings(P):
 
 def run(n=200000):
     print(f"device={DEVICE} dtype={DTYPE}  kink at x1={A_KINK}\n")
-    # choose endpoints on opposite sides of the kink x1=0:
-    #   b near angle  3pi/4  (x1<0),  x near angle  pi/4 (x1>0)
-    tb = torch.tensor(3 * torch.pi / 4, device=DEVICE, dtype=DTYPE)
-    tx = torch.tensor(1 * torch.pi / 4, device=DEVICE, dtype=DTYPE)
+    # Endpoints close together on the BOTTOM of the circle, opposite sides of
+    # the kink x1=0:  b at -3pi/4 (x1<0), x at -pi/4 (x1>0).
+    # - chord: short straight segment across the bottom, x1 monotone, TV_1 small.
+    # - geodesic SHORT: the minor arc along the bottom, also x1 ~monotone.
+    # - geodesic LONG: the MAJOR arc up and over the top -> x1 sweeps
+    #   -0.707 -> -1 -> +1 -> +0.707, crossing x1=0 TWICE, so TV_1 is large.
+    #   This is the case where an on-manifold geodesic carries MORE remainder.
+    tb = torch.tensor(-3 * torch.pi / 4, device=DEVICE, dtype=DTYPE)
+    tx = torch.tensor(-1 * torch.pi / 4, device=DEVICE, dtype=DTYPE)
     b = circle_pt(tb)
     x = circle_pt(tx)
     print(f"b = {b.tolist()}  (x1<0 side)")
     print(f"x = {x.tolist()}  (x1>0 side)")
     print(f"grad f(x) ambient = {batched_grad(f_model, x[None,:])[0].tolist()}")
-    print()
+    print(f"|span| in x1 = {abs((x-b)[0].item()):.4f}\n")
 
     P_chord = chord_path(b, x, n)
-    P_geo = geodesic_path(tb, tx, n)
+    P_geo_s = geodesic_path(tb, tx, n, arc="short")
+    P_geo_l = geodesic_path(tb, tx, n, arc="long")
 
-    for name, P in [("CHORD (leaves manifold)", P_chord),
-                    ("GEODESIC on S^1 (on-manifold)", P_geo)]:
+    rows = [
+        ("CHORD (leaves manifold)", P_chord),
+        ("GEODESIC SHORT arc (on-manifold)", P_geo_s),
+        ("GEODESIC LONG arc  (on-manifold)", P_geo_l),
+    ]
+    for name, P in rows:
         o = audit(f_model, b, x, P)
         xk = count_kink_crossings(P)
         print(f"[{name}]  kink crossings = {xk}")
         print(f"    A (attrib)  = {o['A'].tolist()}")
-        print(f"    L (local)   = {o['L'].tolist()}   <- identical across paths by design")
+        print(f"    L (local)   = {o['L'].tolist()}   <- identical across paths")
         print(f"    R (mixing)  = {o['R'].tolist()}")
         print(f"    E (exposure)= {o['E'].tolist()}")
-        print(f"    TV(gamma_i) = {o['TV'].tolist()}  (chord: TV=|span|; geodesic: TV>|span|)")
+        print(f"    TV(gamma_i) = {o['TV'].tolist()}")
         print()
 
     print("-" * 60)
-    print("EXPECTED (verify when you run):")
-    print("  * geodesic stays ON S^1 (on-manifold) yet still crosses x1=0 kink")
-    print("  * R != 0 and E > 0 for the geodesic => on-manifold+geodesic is NOT local")
-    print("  * geodesic TV(gamma_1) > chord TV(gamma_1) => longer coord-1 travel,")
-    print("    so by the TV bound the geodesic can carry MORE remainder, not less.")
-    print("  * L identical for both (depends only on grad f(x)).")
+    print("WHAT TO CHECK:")
+    print("  * All three cross the kink; SHORT/LONG geodesics stay ON S^1.")
+    print("  * L identical everywhere (depends only on grad f(x)).")
+    print("  * LONG geodesic: TV(gamma_1) >> chord TV(gamma_1) (crosses x1=0 twice),")
+    print("    so by the TV bound |R_1| <= TV(gamma_1) * |jump| is LARGER-allowed;")
+    print("    if |R_1|_long > |R_1|_chord, the on-manifold geodesic is WORSE.")
+    print("  * If |R_1| stays similar but E_1 grows, the extra travel cancelled:")
+    print("    that is the exposure/cancellation distinction, still non-local.")
 
 
 if __name__ == "__main__":
